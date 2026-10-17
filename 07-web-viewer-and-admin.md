@@ -78,6 +78,114 @@ The chart shows elevation vs distance with color bands by gradient, checkpoints 
 - Optional rule: stop publishing positions after the runner finishes.
 - Kill switch from admin.
 
+### 1.7 Option: Google Maps JavaScript API instead of MapLibre
+
+The viewer's data flow (snapshot + SSE, privacy rules, runner cards, elevation chart) is identical. Only the map layer changes.
+
+**Map adapter interface** (so either engine can be used per event):
+
+```ts
+interface MapAdapter {
+  init(container: HTMLElement, opts: { theme: 'light' | 'dark'; mode: 'standard' | 'satellite' | 'terrain' }): void;
+  drawRoute(routeId: string, geojson: GeoJSON.LineString, color: string): void;
+  setRunners(runners: RunnerPoint[]): void;      // batched update, animated
+  addCheckpoints(cps: Checkpoint[]): void;
+  setWeatherLayer(kind: 'rain' | 'cloud' | 'wind' | 'temp' | null): void;
+  setTheme(theme: 'light' | 'dark'): void;
+  setMode(mode: 'standard' | 'satellite' | 'terrain'): void;
+  focusRunner(bib: string): void;
+  onRunnerClick(cb: (bib: string) => void): void;
+}
+```
+
+**Google Maps implementation notes**
+
+| Need | Approach |
+|---|---|
+| Load | Dynamic library import (`google.maps.importLibrary('maps')`, `'marker'`), created once per session |
+| Map modes | `mapTypeId`: `roadmap`, `satellite`, `hybrid`, `terrain` |
+| Light/dark | One cloud-styled Map ID per theme; recreate or switch Map ID when the theme changes |
+| Routes | `google.maps.Polyline` (one per route) or Data layer `addGeoJson` |
+| Runner markers (up to ~500) | `AdvancedMarkerElement` with a small custom DOM pin showing the bib; `@googlemaps/markerclusterer` for clustering |
+| Runner markers (500+) | deck.gl `GoogleMapsOverlay` with a `ScatterplotLayer` / `IconLayer` (WebGL), picking for clicks |
+| Checkpoints | Advanced markers + `InfoWindow` or the app's own bottom sheet |
+| Weather tiles | `new google.maps.ImageMapType({ getTileUrl, tileSize: new google.maps.Size(256, 256), opacity })` pushed into `map.overlayMapTypes`; tile URLs go through your server proxy so API keys stay private |
+| Marker animation | Interpolate positions in `requestAnimationFrame` between updates |
+| Elevation hover | Chart hover sets a marker on the polyline at that route distance |
+
+**Cost and policy checklist**
+
+- Map loads are billed; load the map once per page session and avoid re-initializing it.
+- Restrict the API key by HTTP referrer; set quotas and budget alerts before the event.
+- Keep Google's logo and attribution visible; do not cache or store Google map tiles or content.
+- Estimate cost from expected spectators x sessions before choosing Google for a large event; compare with MapLibre + self-hosted or provider tiles.
+- Do not call Google Elevation or Directions per runner at race time; elevation is precomputed from the GPX/DEM.
+
+### 1.8 Cost-effective map options (self-hosted and low-cost providers)
+
+For a single event, a self-hosted vector basemap is usually the cheapest approach. Pricing and terms change, so re-check each provider before the event.
+
+#### Recommended: Protomaps (PMTiles) + MapLibre
+
+- Generate one vector-tile file (`.pmtiles`) covering only the event area from OpenStreetMap data (small compared with the whole planet).
+- Host the file on object storage behind a CDN (e.g. Cloudflare R2, or S3 + CloudFront).
+- MapLibre reads it directly with HTTP range requests (PMTiles protocol). No tile server, no per-map-load fees, no API key.
+- Use Protomaps' light and dark basemap styles for the theme toggle.
+- Cost is mostly storage and bandwidth; CDN caching keeps both low during spectator spikes.
+
+**Build and hosting steps**
+
+1. Choose the bounding box around all routes plus a margin.
+2. Extract that area from a Protomaps/OSM build into a `.pmtiles` file using the `pmtiles` CLI.
+3. Upload the file to object storage; enable CORS and range requests; put a CDN in front with long cache times.
+4. In MapLibre, register the `pmtiles://` protocol and point the style's vector source at the file URL.
+5. Set `maxBounds` and a limited zoom range on the map so users only request tiles that exist.
+6. Keep light and dark style JSON files in your app; switch with `setStyle`.
+
+#### Terrain and elevation without a paid provider
+
+- Use open elevation data (Copernicus or SRTM-derived) as raster-DEM tiles.
+- MapLibre can render hillshade from them; the `maplibre-contour` plugin can generate contour lines in the browser.
+- To avoid depending on a public DEM host during the event, cache the DEM tiles for your bounding box (or package them as a PMTiles file) and serve them from your own CDN.
+- OpenTopoMap exists as a ready-made topographic style, but its usage policy discourages heavy production traffic.
+
+#### Satellite imagery (the hard part)
+
+Good imagery is rarely free for commercial use. Options:
+
+| Option | Notes |
+|---|---|
+| Optional paid layer from a provider (MapTiler, Mapbox, Stadia) | Load only when the user switches to satellite; set a hard budget cap |
+| Open imagery (Sentinel-2 based layers) | Check license (some are non-commercial); low resolution for trail detail |
+| Skip satellite | Terrain + route is often enough for a trail event |
+
+Default view stays on the free vector basemap, so most viewers never trigger satellite costs.
+
+#### Hosted providers (if not self-hosting)
+
+| Provider | Notes |
+|---|---|
+| MapTiler | Free plan is non-commercial only, requires the MapTiler logo, and stops at about 5,000 sessions and 100,000 requests per month. A commercial event needs a paid plan; check current pricing. |
+| Stadia Maps, Thunderforest, Geoapify, Mapbox | Free tiers and low-cost plans; compare per-session or per-request limits against expected spectators |
+| OpenStreetMap public tile servers | **Do not use** for production events; their policy does not allow heavy use |
+
+#### Other savings
+
+- Limit the map to the event's bounds and a limited zoom range.
+- Proxy and cache weather tiles on your server (RainViewer, OpenWeatherMap) so thousands of viewers share a few upstream requests; re-check their free-tier terms before the event.
+- Serve the public snapshot through a CDN with a short TTL (3-5 s).
+- Prefer vector tiles over raster tiles (smaller, cache better, work for both themes).
+
+#### Comparison
+
+| Option | Cost during spectator spikes | Setup effort | Satellite |
+|---|---|---|---|
+| Google Maps | Highest (billed per map load) | Low | Yes |
+| Hosted provider (paid plan) | Medium (plan-based) | Low | Usually |
+| Protomaps + CDN | Lowest | Medium (one-time setup) | No; optional paid layer |
+
+**Recommendation:** Protomaps on MapLibre for streets and terrain, with satellite either skipped or limited to a budget-capped paid provider. Keep the map adapter interface from section 1.7 so Google Maps can be used for an event where budget is not a concern.
+
 ## 2. Admin dashboard
 
 **Roles:** `organizer`, `admin`. Auth with SSO or email + password with MFA.
